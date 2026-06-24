@@ -10,13 +10,11 @@
 #include <Preferences.h>
 
 #include "esp_wifi.h"
-#include "esp_task_wdt.h"
-#include "mbedtls/gcm.h"
+#include "mbedtls/aes.h"
 #include "mbedtls/base64.h"
+#include "mbedtls/md.h"
 
 #include "version.h"
-
-// ==================================================
 
 // --------------------------------------------------
 // RTOS Task Handles
@@ -27,32 +25,21 @@ TaskHandle_t otaTaskHandle    = NULL;
 TaskHandle_t wifiTaskHandle   = NULL;
 
 SemaphoreHandle_t mqttMutex;
-SemaphoreHandle_t configMutex;   // guards mqttServer/User/Pass + cachedSSID/PSK
 
 // --------------------------------------------------
 // Global State
 // --------------------------------------------------
-unsigned long lastReconnectAttempt   = 0;
-int           wifiFailureCount       = 0;
-bool          portalRunning          = false;
-unsigned long lastPortalOpenAttempt  = 0;
+unsigned long lastReconnectAttempt = 0;
+int           wifiFailureCount     = 0;
+bool          portalRunning        = false;
 
-#define PORTAL_MIN_REOPEN_INTERVAL_MS 60000UL
-
-// Cached credentials — populated at boot from flash, reliable even
-// after WiFi disconnects (WiFi.SSID() returns empty once the link
-// drops). Always access via setCachedCredentials()/getCachedCredentials().
+// Cached credentials — populated at boot from flash,
+// reliable even after WiFi disconnects (WiFi.SSID()
+// returns empty once the link drops).
 String cachedSSID = "";
 String cachedPSK  = "";
 
 WiFiManager wm;
-
-// Allocated once in setupConfigPortal() and never freed — WiFiManager
-// keeps raw pointers to these, and the portal can be reopened later
-// from wifiTask, so they must outlive the whole program.
-WiFiManagerParameter *custom_mqtt_server = nullptr;
-WiFiManagerParameter *custom_mqtt_user   = nullptr;
-WiFiManagerParameter *custom_mqtt_pass   = nullptr;
 
 // --------------------------------------------------
 // DHT11
@@ -62,7 +49,7 @@ WiFiManagerParameter *custom_mqtt_pass   = nullptr;
 DHT dht(DHTPIN, DHTTYPE);
 
 // --------------------------------------------------
-// AES Key (AES-128, 16 bytes) — used as the GCM key
+// AES Key (AES-128, 16 bytes)
 // --------------------------------------------------
 uint8_t AES_KEY[16];
 
@@ -173,156 +160,103 @@ void initializeAESKey()
 }
 
 // --------------------------------------------------
-// AES-128-GCM encrypt -> ivHex:base64(ciphertext):tagHex
-//
-// GCM gives confidentiality + integrity from a single key, so there is
-// no HMAC key to manage (and no key-reuse risk), and no padding (so no
-// padding-oracle-style surface either). A fresh random 96-bit nonce is
-// generated per message; collision probability over a device's
-// lifetime at a 5s publish interval is negligible.
+// HMAC-SHA256
 // --------------------------------------------------
-#define GCM_IV_LEN  12
-#define GCM_TAG_LEN 16
-
-String encryptGCM(const String &plainText)
+String createHMAC(String payload)
 {
-    uint8_t iv[GCM_IV_LEN];
-    for (int i = 0; i < GCM_IV_LEN; i++)
-        iv[i] = esp_random() & 0xFF;
-
-    size_t inputLen = plainText.length();
-
-    // Bounds check before we do anything else — guards against a future
-    // schema change silently overflowing the fixed base64 buffer below.
-    size_t b64Capacity = 4 * ((inputLen + 2) / 3) + 4;
-    if (inputLen == 0 || b64Capacity > 700)
-    {
-        Serial.println("encryptGCM: payload size out of bounds — refusing");
-        return "";
-    }
-
-    uint8_t output[inputLen];
-    uint8_t tag[GCM_TAG_LEN];
-
-    mbedtls_gcm_context gcm;
-    mbedtls_gcm_init(&gcm);
-
-    int rc = mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, AES_KEY, 128);
-    if (rc != 0)
-    {
-        mbedtls_gcm_free(&gcm);
-        Serial.println("encryptGCM: setkey failed");
-        return "";
-    }
-
-    rc = mbedtls_gcm_crypt_and_tag(
-        &gcm, MBEDTLS_GCM_ENCRYPT,
-        inputLen,
-        iv, GCM_IV_LEN,
-        NULL, 0,                          // no additional authenticated data
-        (const uint8_t*)plainText.c_str(), output,
-        GCM_TAG_LEN, tag
+    unsigned char hmac[32];
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(
+        &ctx,
+        mbedtls_md_info_from_type(MBEDTLS_MD_SHA256),
+        1
     );
-    mbedtls_gcm_free(&gcm);
+    mbedtls_md_hmac_starts(&ctx, AES_KEY, 16);
+    mbedtls_md_hmac_update(
+        &ctx,
+        (unsigned char*)payload.c_str(),
+        payload.length()
+    );
+    mbedtls_md_hmac_finish(&ctx, hmac);
+    mbedtls_md_free(&ctx);
 
-    if (rc != 0)
+    String result = "";
+    for (int i = 0; i < 32; i++)
     {
-        Serial.println("encryptGCM: encrypt failed");
-        return "";
+        char tmp[3];
+        sprintf(tmp, "%02x", hmac[i]);
+        result += tmp;
     }
+    return result;
+}
+
+// --------------------------------------------------
+// AES-128-CBC encrypt -> ivHex:base64(ciphertext)
+// --------------------------------------------------
+void generateRandomIV(uint8_t *iv)
+{
+    for (int i = 0; i < 16; i++)
+        iv[i] = esp_random() & 0xFF;
+}
+
+String encryptAES(String plainText)
+{
+    uint8_t randomIV[16];
+    generateRandomIV(randomIV);
+
+    int inputLen  = plainText.length();
+    int paddedLen = ((inputLen / 16) + 1) * 16;
+
+    uint8_t input[paddedLen];
+    memset(input, 0, paddedLen);
+    memcpy(input, plainText.c_str(), inputLen);
+
+    uint8_t pad = paddedLen - inputLen;
+    for (int i = inputLen; i < paddedLen; i++)
+        input[i] = pad;
+
+    uint8_t output[paddedLen];
+
+    mbedtls_aes_context aes;
+    mbedtls_aes_init(&aes);
+
+    uint8_t iv[16];
+    memcpy(iv, randomIV, 16);
+
+    mbedtls_aes_setkey_enc(&aes, AES_KEY, 128);
+    mbedtls_aes_crypt_cbc(
+        &aes,
+        MBEDTLS_AES_ENCRYPT,
+        paddedLen,
+        iv,
+        input,
+        output
+    );
+    mbedtls_aes_free(&aes);
 
     size_t        outLen = 0;
-    unsigned char base64Buf[700];
-    mbedtls_base64_encode(base64Buf, sizeof(base64Buf), &outLen, output, inputLen);
+    unsigned char base64Buf[512];
+    mbedtls_base64_encode(
+        base64Buf, sizeof(base64Buf),
+        &outLen,
+        output, paddedLen
+    );
     base64Buf[outLen] = '\0';
 
-    String ivHex  = bytesToHex(iv, GCM_IV_LEN);
-    String tagHex = bytesToHex(tag, GCM_TAG_LEN);
-
-    return ivHex + ":" + String((char*)base64Buf) + ":" + tagHex;
-}
-
-// --------------------------------------------------
-// Firmware version compare (simple semver, "X.Y.Z")
-// Returns >0 if a is newer than b, <0 if older, 0 if equal.
-// Falls back to "treat as different" if either string doesn't parse.
-// --------------------------------------------------
-int compareVersions(const String &a, const String &b)
-{
-    int aMaj = 0, aMin = 0, aPatch = 0;
-    int bMaj = 0, bMin = 0, bPatch = 0;
-
-    int aMatched = sscanf(a.c_str(), "%d.%d.%d", &aMaj, &aMin, &aPatch);
-    int bMatched = sscanf(b.c_str(), "%d.%d.%d", &bMaj, &bMin, &bPatch);
-
-    if (aMatched < 2 || bMatched < 2)
-        return (a == b) ? 0 : 1;
-
-    if (aMaj != bMaj) return aMaj - bMaj;
-    if (aMin != bMin) return aMin - bMin;
-    return aPatch - bPatch;
-}
-
-// --------------------------------------------------
-// Timestamp helper — time(nullptr) reads as a small epoch value before
-// NTP has synced; treat that as "unsynced" rather than publishing a
-// misleading timestamp. Telemetry also carries millis() separately as
-// an always-valid monotonic fallback.
-// --------------------------------------------------
-unsigned long getTimestamp()
-{
-    time_t now = time(nullptr);
-    if (now < 1577836800) // 2020-01-01T00:00:00Z
-        return 0;
-    return (unsigned long)now;
-}
-
-// --------------------------------------------------
-// Per-device config portal password, derived from the efuse MAC.
-// Still serial-only rather than a physical label — fine for
-// prototyping, but print this on a label at manufacture time for a
-// real deployment instead of relying on serial access.
-// --------------------------------------------------
-String getPortalPassword()
-{
-    uint64_t mac = ESP.getEfuseMac();
-    char buf[13];
-    snprintf(buf, sizeof(buf), "%012llX", mac);
-    return "ESP-" + String(buf).substring(6);
-}
-
-// --------------------------------------------------
-// Shared-state accessors (configMutex-protected)
-// --------------------------------------------------
-void setCachedCredentials(const String &ssid, const String &psk)
-{
-    if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(1000)))
+    String ivHex = "";
+    for (int i = 0; i < 16; i++)
     {
-        cachedSSID = ssid;
-        cachedPSK  = psk;
-        xSemaphoreGive(configMutex);
+        char buf[3];
+        sprintf(buf, "%02X", randomIV[i]);
+        ivHex += buf;
     }
-}
 
-bool getCachedCredentials(String &ssidOut, String &pskOut)
-{
-    bool ok = false;
-    if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(1000)))
-    {
-        ssidOut = cachedSSID;
-        pskOut  = cachedPSK;
-        ok = ssidOut.length() > 0;
-        xSemaphoreGive(configMutex);
-    }
-    return ok;
+    return ivHex + ":" + String((char*)base64Buf);
 }
 
 // --------------------------------------------------
 // OTA over HTTP
-//
-// NOTE: left exactly as in the original sketch. otaClient.setInsecure()
-// and the lack of any firmware-image signature check are a known,
-// separate issue — out of scope for this revision.
 // --------------------------------------------------
 void doOTA(String url)
 {
@@ -369,7 +303,7 @@ void callback(char* topic, byte* payload, unsigned int length)
 
     if (String(topic) == "home/esp32/update")
     {
-        StaticJsonDocument<512> doc;
+        DynamicJsonDocument doc(512);
         DeserializationError err = deserializeJson(doc, msg);
         if (err)
         {
@@ -383,9 +317,9 @@ void callback(char* topic, byte* payload, unsigned int length)
         Serial.print("Current Version:   "); Serial.println(FW_VERSION);
         Serial.print("Available Version: "); Serial.println(newVersion);
 
-        if (compareVersions(newVersion, FW_VERSION) <= 0)
+        if (newVersion == FW_VERSION)
         {
-            Serial.println("Not newer than current version — ignoring");
+            Serial.println("Already up to date");
             return;
         }
 
@@ -398,10 +332,11 @@ void callback(char* topic, byte* payload, unsigned int length)
 // --------------------------------------------------
 // loadCredentialsFromFlash
 //
-// Reads WiFi credentials from the ESP32 WiFi NVS partition directly
-// via esp_wifi_get_config(). This is the only reliable source once
-// WiFi has disconnected — WiFi.SSID() / WiFi.psk() go empty after the
-// link drops.
+// Reads WiFi credentials from the ESP32 WiFi NVS
+// partition directly via esp_wifi_get_config().
+// This is the only reliable source once WiFi has
+// disconnected — WiFi.SSID() / WiFi.psk() go empty
+// after the link drops.
 // --------------------------------------------------
 void loadCredentialsFromFlash()
 {
@@ -415,9 +350,10 @@ void loadCredentialsFromFlash()
 
         if (ssid.length() > 0)
         {
-            setCachedCredentials(ssid, psk);
+            cachedSSID = ssid;
+            cachedPSK  = psk;
             Serial.print("Credentials loaded from flash. SSID: ");
-            Serial.println(ssid);
+            Serial.println(cachedSSID);
         }
         else
         {
@@ -431,143 +367,83 @@ void loadCredentialsFromFlash()
 }
 
 // --------------------------------------------------
-// openConfigPortal
-//
-// Centralised, rate-limited portal opener. Without rate limiting, an
-// attacker who can knock the device off WiFi repeatedly could force
-// the portal to reopen in a tight loop; this caps reopens to once a
-// minute and persists a counter so the operator can see in MQTT
-// ("home/esp32/portal_events") whether the portal has been opening
-// more than expected.
-// --------------------------------------------------
-void openConfigPortal()
-{
-    if (portalRunning) return;
-
-    unsigned long now = millis();
-    if (lastPortalOpenAttempt != 0 &&
-        now - lastPortalOpenAttempt < PORTAL_MIN_REOPEN_INTERVAL_MS)
-    {
-        Serial.println("Portal reopen suppressed — rate limited");
-        return;
-    }
-    lastPortalOpenAttempt = now;
-
-    prefs.begin("security", false);
-    uint32_t opens = prefs.getUInt("portal_opens", 0) + 1;
-    prefs.putUInt("portal_opens", opens);
-    prefs.end();
-
-    String pwd = getPortalPassword();
-    Serial.print("Opening config portal. Password: ");
-    Serial.println(pwd);
-
-    wm.setConfigPortalBlocking(false);
-    wm.startConfigPortal("ESP32_Config", pwd.c_str());
-    portalRunning = true;
-}
-
-// --------------------------------------------------
-// onPortalSave
-//
-// Plain function (not a [&]-capturing lambda) reading from file-scope
-// WiFiManagerParameter pointers, so it stays valid no matter how many
-// times the portal is reopened over the device's lifetime.
-// --------------------------------------------------
-void onPortalSave()
-{
-    if (!custom_mqtt_server || !custom_mqtt_user || !custom_mqtt_pass)
-        return; // defensive — should be unreachable if setup ran correctly
-
-    String newServer = String(custom_mqtt_server->getValue());
-    String newUser   = String(custom_mqtt_user->getValue());
-    String newPass   = String(custom_mqtt_pass->getValue());
-
-    prefs.begin("config", false);
-    prefs.putString("mqtt_server", newServer);
-    prefs.putString("mqtt_user",   newUser);
-    prefs.putString("mqtt_pass",   newPass);
-    prefs.end();
-
-    // Track config changes for the same visibility reason as portal_opens.
-    prefs.begin("security", false);
-    uint32_t saves = prefs.getUInt("config_saves", 0) + 1;
-    prefs.putUInt("config_saves", saves);
-    prefs.end();
-
-    if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(1000)))
-    {
-        mqttServer = newServer;
-        mqttUser   = newUser;
-        mqttPass   = newPass;
-        xSemaphoreGive(configMutex);
-    }
-
-    Serial.println("MQTT config saved from portal");
-
-    // Force an immediate reconnect against the new server/credentials
-    // instead of waiting for the existing broker connection to drop on
-    // its own — mqttTask re-reads mqttServer/User/Pass on its next
-    // reconnect attempt.
-    if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)))
-    {
-        client.disconnect();
-        xSemaphoreGive(mqttMutex);
-    }
-
-    // WiFiManager has just written the new SSID/PSK to flash — give it
-    // a tick, then re-read so wifiTask always has fresh values.
-    delay(200);
-    loadCredentialsFromFlash();
-}
-
-// --------------------------------------------------
 // setupConfigPortal
 //
 // Boot strategy:
-//   1. If flash has saved credentials, try them directly for up to
-//      15 s (fast path).
+//   1. If flash has saved credentials, try them
+//      directly for up to 15 s (fast path).
 //   2. If that succeeds, continue normally.
-//   3. If it fails (router down at boot), open the non-blocking
-//      portal so setup() can finish and wifiTask can own all retry +
-//      portal logic.
-//   4. If no credentials are stored at all (first boot), run the
-//      BLOCKING portal until the user submits credentials — there is
-//      nothing else to do anyway.
+//   3. If it fails (router down at boot), start the
+//      NON-BLOCKING portal so setup() can finish and
+//      wifiTask can own all retry + portal logic.
+//   4. If no credentials are stored at all (first
+//      boot), run the BLOCKING portal until the user
+//      submits credentials — there is nothing else
+//      to do anyway.
 // --------------------------------------------------
 void setupConfigPortal()
 {
+    // Load saved MQTT config from NVS
     prefs.begin("config", true);
     String savedServer = prefs.getString("mqtt_server", "");
     String savedUser   = prefs.getString("mqtt_user",   "");
     String savedPass   = prefs.getString("mqtt_pass",   "");
     prefs.end();
 
-    // Heap-allocated, file-scope pointers — see the comment on the
-    // declarations above for why this matters.
-    custom_mqtt_server = new WiFiManagerParameter("server", "MQTT Server",   savedServer.c_str(), 100);
-    custom_mqtt_user   = new WiFiManagerParameter("user",   "MQTT Username", savedUser.c_str(),   50);
-    custom_mqtt_pass   = new WiFiManagerParameter("pass",   "MQTT Password", savedPass.c_str(),   50);
+    WiFiManagerParameter custom_mqtt_server(
+        "server", "MQTT Server",   savedServer.c_str(), 100);
+    WiFiManagerParameter custom_mqtt_user(
+        "user",   "MQTT Username", savedUser.c_str(),   50);
+    WiFiManagerParameter custom_mqtt_pass(
+        "pass",   "MQTT Password", savedPass.c_str(),   50);
 
-    wm.addParameter(custom_mqtt_server);
-    wm.addParameter(custom_mqtt_user);
-    wm.addParameter(custom_mqtt_pass);
-    wm.setSaveParamsCallback(onPortalSave);
+    wm.addParameter(&custom_mqtt_server);
+    wm.addParameter(&custom_mqtt_user);
+    wm.addParameter(&custom_mqtt_pass);
+
+    // Persist MQTT params and refresh credential cache when
+    // the user submits the portal form.
+    wm.setSaveParamsCallback([&]() {
+        String newServer = String(custom_mqtt_server.getValue());
+        String newUser   = String(custom_mqtt_user.getValue());
+        String newPass   = String(custom_mqtt_pass.getValue());
+
+        prefs.begin("config", false);
+        prefs.putString("mqtt_server", newServer);
+        prefs.putString("mqtt_user",   newUser);
+        prefs.putString("mqtt_pass",   newPass);
+        prefs.end();
+
+        mqttServer = newServer;
+        mqttUser   = newUser;
+        mqttPass   = newPass;
+
+        Serial.println("MQTT config saved from portal");
+
+        // Refresh cached WiFi creds — WiFiManager has just
+        // written the new SSID/PSK to flash. Give it a tick
+        // then re-read so wifiTask always has fresh values.
+        delay(200);
+        loadCredentialsFromFlash();
+    });
 
     // Read credentials that WiFiManager previously saved to flash.
-    // Do this BEFORE any WiFi.begin() call while the stack is idle so
-    // WiFi.SSID() / esp_wifi_get_config() are still populated.
+    // Do this BEFORE any WiFi.begin() call while the stack is idle
+    // so WiFi.SSID() is still populated.
     WiFi.mode(WIFI_STA);
+
+    // Give the WiFi stack a moment to initialise so
+    // esp_wifi_get_config returns valid data.
     delay(100);
     loadCredentialsFromFlash();
 
-    String ssid, psk;
-    if (getCachedCredentials(ssid, psk))
+    if (cachedSSID.length() > 0)
     {
+        // ── Saved credentials exist: try them for up to 15 s ──────────
         Serial.print("Boot: connecting to saved SSID: ");
-        Serial.println(ssid);
+        Serial.println(cachedSSID);
 
-        WiFi.begin(ssid.c_str(), psk.c_str());
+        WiFi.begin(cachedSSID.c_str(), cachedPSK.c_str());
 
         unsigned long start = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - start < 15000)
@@ -583,30 +459,32 @@ void setupConfigPortal()
         }
         else
         {
-            Serial.println("Boot WiFi failed. Starting non-blocking portal...");
-            openConfigPortal();
+            // Router unreachable at boot — start non-blocking portal.
+            // wifiTask will keep retrying cachedSSID in the background.
+            Serial.println(
+                "Boot WiFi failed. Starting non-blocking portal..."
+            );
+            wm.setConfigPortalBlocking(false);
+            wm.startConfigPortal("ESP32_Config", "admin123");
+            portalRunning = true;
         }
     }
     else
     {
-        Serial.println("No saved credentials. Starting blocking portal...");
-        String pwd = getPortalPassword();
-        Serial.print("Portal password: ");
-        Serial.println(pwd);
-        wm.autoConnect("ESP32_Config", pwd.c_str());
+        // ── First boot / credentials wiped: must block for user input ──
+        Serial.println(
+            "No saved credentials. Starting blocking portal..."
+        );
+        wm.autoConnect("ESP32_Config", "admin123");
 
         // After autoConnect the new credentials are in flash; cache them.
         loadCredentialsFromFlash();
     }
 
     // Read MQTT values — correct whether portal ran or not.
-    if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(1000)))
-    {
-        mqttServer = String(custom_mqtt_server->getValue());
-        mqttUser   = String(custom_mqtt_user->getValue());
-        mqttPass   = String(custom_mqtt_pass->getValue());
-        xSemaphoreGive(configMutex);
-    }
+    mqttServer = String(custom_mqtt_server.getValue());
+    mqttUser   = String(custom_mqtt_user.getValue());
+    mqttPass   = String(custom_mqtt_pass.getValue());
 
     Serial.print("MQTT Server: ");
     Serial.println(mqttServer);
@@ -617,77 +495,39 @@ void setupConfigPortal()
 // --------------------------------------------------
 void mqttTask(void *pvParameters)
 {
-    esp_task_wdt_add(NULL);
-
     while (true)
     {
-        esp_task_wdt_reset();
-
-        if (!client.connected())
+        if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(100)))
         {
-            if (millis() - lastReconnectAttempt >= 5000)
+            if (!client.connected())
             {
-                lastReconnectAttempt = millis();
-
-                // Snapshot config under configMutex, then release it
-                // before touching the MQTT client — never hold both
-                // mutexes at once (avoids any lock-ordering deadlock
-                // risk against onPortalSave()).
-                String localServer, localUser, localPass;
-                if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(500)))
+                if (millis() - lastReconnectAttempt >= 5000)
                 {
-                    localServer = mqttServer;
-                    localUser   = mqttUser;
-                    localPass   = mqttPass;
-                    xSemaphoreGive(configMutex);
-                }
+                    lastReconnectAttempt = millis();
 
-                Serial.print("Connecting MQTT... ");
+                    Serial.print("Connecting MQTT... ");
 
-                String clientId =
-                    "ESP32_" + String((uint32_t)ESP.getEfuseMac(), HEX);
-
-                if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)))
-                {
-                    // Re-applied every attempt so a server changed via
-                    // the portal takes effect without a reboot.
-                    client.setServer(localServer.c_str(), mqttPort);
+                    String clientId =
+                        "ESP32_" +
+                        String((uint32_t)ESP.getEfuseMac(), HEX);
 
                     if (client.connect(
                             clientId.c_str(),
-                            localUser.c_str(),
-                            localPass.c_str()))
+                            mqttUser.c_str(),
+                            mqttPass.c_str()))
                     {
                         Serial.println("connected");
                         client.subscribe("home/esp32/update");
                         Serial.println("Subscribed to OTA topic");
-
-                        // Retained visibility into portal/config activity.
-                        prefs.begin("security", true);
-                        uint32_t portalOpens = prefs.getUInt("portal_opens", 0);
-                        uint32_t configSaves = prefs.getUInt("config_saves", 0);
-                        prefs.end();
-
-                        StaticJsonDocument<128> evt;
-                        evt["portal_opens"] = portalOpens;
-                        evt["config_saves"] = configSaves;
-                        String evtPayload;
-                        serializeJson(evt, evtPayload);
-                        client.publish("home/esp32/portal_events", evtPayload.c_str(), true);
                     }
                     else
                     {
                         Serial.print("failed rc=");
                         Serial.println(client.state());
                     }
-
-                    xSemaphoreGive(mqttMutex);
                 }
             }
-        }
 
-        if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(100)))
-        {
             client.loop();
             xSemaphoreGive(mqttMutex);
         }
@@ -701,12 +541,8 @@ void mqttTask(void *pvParameters)
 // --------------------------------------------------
 void otaTask(void *pvParameters)
 {
-    esp_task_wdt_add(NULL);
-
     while (true)
     {
-        esp_task_wdt_reset();
-
         ArduinoOTA.handle();
 
         if (otaRequested)
@@ -717,13 +553,7 @@ void otaTask(void *pvParameters)
                 "OTA stack free before update: %u\n",
                 uxTaskGetStackHighWaterMark(NULL)
             );
-
-            // The download can legitimately run long enough to trip the
-            // watchdog — drop this task's WDT subscription for the
-            // duration, then re-subscribe once it returns.
-            esp_task_wdt_delete(NULL);
             doOTA(pendingOTAUrl);
-            esp_task_wdt_add(NULL);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -735,35 +565,30 @@ void otaTask(void *pvParameters)
 // --------------------------------------------------
 void sensorTask(void *pvParameters)
 {
-    esp_task_wdt_add(NULL);
-
     while (true)
     {
-        esp_task_wdt_reset();
-
         float temp = dht.readTemperature();
         float hum  = dht.readHumidity();
 
         if (!isnan(temp) && !isnan(hum))
         {
-            StaticJsonDocument<512> doc;
+            DynamicJsonDocument doc(512);
             doc["temp"]      = temp;
             doc["hum"]       = hum;
             doc["device"]    = "ESP32_01";
-            doc["timestamp"] = getTimestamp();  // 0 if NTP not yet synced
-            doc["uptime_ms"] = millis();        // always-valid monotonic fallback
+            doc["timestamp"] = time(nullptr);
             doc["nonce"]     = String(esp_random());
 
             String payload;
             serializeJson(doc, payload);
 
-            String encrypted = encryptGCM(payload);
+            String hmac = createHMAC(payload);
+            doc["hmac"] = hmac;
+            serializeJson(doc, payload);
 
-            if (encrypted.length() == 0)
-            {
-                Serial.println("Encryption failed — skipping publish");
-            }
-            else if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)))
+            String encrypted = encryptAES(payload);
+
+            if (xSemaphoreTake(mqttMutex, pdMS_TO_TICKS(1000)))
             {
                 if (client.connected())
                 {
@@ -781,12 +606,10 @@ void sensorTask(void *pvParameters)
                 xSemaphoreGive(mqttMutex);
             }
 
-#ifdef DEBUG_CRYPTO
             Serial.println("Plain:");
             Serial.println(payload);
             Serial.println("Encrypted:");
             Serial.println(encrypted);
-#endif
         }
         else
         {
@@ -800,25 +623,27 @@ void sensorTask(void *pvParameters)
 // --------------------------------------------------
 // RTOS Task: WiFi watchdog & reconnect
 //
-// Uses getCachedCredentials()/setCachedCredentials() throughout, so
-// access is always configMutex-protected regardless of which task
-// last updated them.
+// Uses cachedSSID / cachedPSK throughout — these are
+// populated at boot from flash and updated whenever
+// the portal saves new credentials, so they are
+// always valid regardless of WiFi link state.
+//
+// States:
+//   WL_CONNECTED   - healthy, poll every 10 s
+//   portalRunning  - serve portal + retry cached
+//                    creds every 10 s in background
+//   disconnected   - attempt reconnect; open portal
+//                    after 6 consecutive failures
 // --------------------------------------------------
 #define PORTAL_RETRY_INTERVAL_MS   10000  // background retry period
 #define PORTAL_PROCESS_INTERVAL_MS   100  // wm.process() poll interval
-#define NTP_RESYNC_INTERVAL_MS   3600000UL // 1 hour
 
 void wifiTask(void *pvParameters)
 {
-    esp_task_wdt_add(NULL);
-
     unsigned long lastPortalRetry = 0;
-    unsigned long lastNtpSync     = 0;
 
     while (true)
     {
-        esp_task_wdt_reset();
-
         // ── Connected ────────────────────────────────────────────────────
         if (WiFi.status() == WL_CONNECTED)
         {
@@ -830,15 +655,6 @@ void wifiTask(void *pvParameters)
                 wifiFailureCount = 0;
             }
             wifiFailureCount = 0;
-
-            // Periodic resync so a missed first sync (or RTC drift over
-            // long uptimes) doesn't leave timestamps wrong indefinitely.
-            if (lastNtpSync == 0 || millis() - lastNtpSync >= NTP_RESYNC_INTERVAL_MS)
-            {
-                configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
-                lastNtpSync = millis();
-            }
-
             vTaskDelay(pdMS_TO_TICKS(10000));
         }
 
@@ -851,16 +667,15 @@ void wifiTask(void *pvParameters)
             {
                 lastPortalRetry = now;
 
-                String ssid, psk;
-                if (getCachedCredentials(ssid, psk))
+                if (cachedSSID.length() > 0)
                 {
                     Serial.print(
                         "[Portal] Retrying cached SSID in background: "
                     );
-                    Serial.println(ssid);
+                    Serial.println(cachedSSID);
 
                     // AP+STA: WiFi.begin() runs while portal AP stays up
-                    WiFi.begin(ssid.c_str(), psk.c_str());
+                    WiFi.begin(cachedSSID.c_str(), cachedPSK.c_str());
                 }
                 else
                 {
@@ -871,6 +686,7 @@ void wifiTask(void *pvParameters)
                 }
             }
 
+            // Check if the background retry just succeeded
             if (WiFi.status() == WL_CONNECTED)
             {
                 Serial.println(
@@ -891,21 +707,19 @@ void wifiTask(void *pvParameters)
         {
             Serial.println("WiFi lost. Attempting reconnect...");
 
-            String ssid, psk;
-            if (getCachedCredentials(ssid, psk))
+            if (cachedSSID.length() > 0)
             {
                 WiFi.disconnect(false, false);
                 vTaskDelay(pdMS_TO_TICKS(500));
 
                 Serial.print("Reconnecting to: ");
-                Serial.println(ssid);
+                Serial.println(cachedSSID);
 
-                WiFi.begin(ssid.c_str(), psk.c_str());
+                WiFi.begin(cachedSSID.c_str(), cachedPSK.c_str());
 
                 int retries = 0;
                 while (WiFi.status() != WL_CONNECTED && retries < 20)
                 {
-                    esp_task_wdt_reset();
                     Serial.print(".");
                     vTaskDelay(pdMS_TO_TICKS(500));
                     retries++;
@@ -934,7 +748,9 @@ void wifiTask(void *pvParameters)
                     Serial.println(
                         "6 failures — starting non-blocking portal..."
                     );
-                    openConfigPortal();
+                    wm.setConfigPortalBlocking(false);
+                    wm.startConfigPortal("ESP32_Config", "admin123");
+                    portalRunning   = true;
                     lastPortalRetry = 0; // trigger immediate first retry
                 }
                 else
@@ -954,32 +770,13 @@ void setup()
     Serial.begin(115200);
     delay(3000);
 
-    // Mutexes first — setupConfigPortal() below touches shared config
-    // state and must not do so before they exist.
-    configMutex = xSemaphoreCreateMutex();
-    mqttMutex   = xSemaphoreCreateMutex();
-    if (configMutex == NULL || mqttMutex == NULL)
-    {
-        Serial.println("Mutex creation failed — restarting");
-        ESP.restart();
-    }
-
-    // Task watchdog: catches any of the RTOS tasks below hanging
-    // instead of letting the device sit dead until someone notices.
-    // NOTE: this signature matches arduino-esp32 core <3.0. On core
-    // 3.x, switch to the esp_task_wdt_config_t struct-based
-    // esp_task_wdt_init().
-    esp_task_wdt_init(60, true);
-
     Serial.println("Initialising AES key...");
     initializeAESKey();
 
-#ifdef DEBUG_CRYPTO
     Serial.print("AES Key: ");
     for (int i = 0; i < 16; i++)
         Serial.printf("%02X", AES_KEY[i]);
     Serial.println();
-#endif
 
     dht.begin();
 
@@ -1002,8 +799,8 @@ void setup()
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
 
-    // NTP — only meaningful when connected; wifiTask resyncs hourly and
-    // retries connectivity on its own if this first attempt fails.
+    // NTP — only meaningful when connected; wifiTask will
+    // reconnect if needed and MQTT will retry on its own.
     if (WiFi.status() == WL_CONNECTED)
     {
         configTime(19800, 0, "pool.ntp.org", "time.nist.gov");
@@ -1018,19 +815,22 @@ void setup()
         if (getLocalTime(&timeinfo))
             Serial.println("Time synced");
         else
-            Serial.println("NTP failed — wifiTask will retry hourly once connected");
+            Serial.println("NTP failed — will rely on task retries");
     }
 
     // TLS + MQTT
     secureClient.setCACert(ca_cert);
-
-    if (xSemaphoreTake(configMutex, pdMS_TO_TICKS(1000)))
-    {
-        client.setServer(mqttServer.c_str(), mqttPort);
-        xSemaphoreGive(configMutex);
-    }
+    client.setServer(mqttServer.c_str(), mqttPort);
     client.setBufferSize(1024);
     client.setCallback(callback);
+
+    // Mutex
+    mqttMutex = xSemaphoreCreateMutex();
+    if (mqttMutex == NULL)
+    {
+        Serial.println("Mutex creation failed — restarting");
+        ESP.restart();
+    }
 
     // Launch RTOS tasks
     xTaskCreatePinnedToCore(
