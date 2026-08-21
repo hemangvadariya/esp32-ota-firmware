@@ -10,7 +10,7 @@
 #include <Preferences.h>
 
 #include "esp_wifi.h"
-#include "esp_task_wdt.h"
+//#include "esp_task_wdt.h"
 #include "mbedtls/gcm.h"
 #include "mbedtls/base64.h"
 
@@ -615,11 +615,11 @@ void setupConfigPortal()
 // --------------------------------------------------
 void mqttTask(void *pvParameters)
 {
-    esp_task_wdt_add(NULL);
+    //esp_task_wdt_add(NULL);
 
     while (true)
     {
-        esp_task_wdt_reset();
+        //esp_task_wdt_reset();
 
         if (!client.connected())
         {
@@ -699,11 +699,11 @@ void mqttTask(void *pvParameters)
 // --------------------------------------------------
 void otaTask(void *pvParameters)
 {
-    esp_task_wdt_add(NULL);
+    //esp_task_wdt_add(NULL);
 
     while (true)
     {
-        esp_task_wdt_reset();
+        //esp_task_wdt_reset();
 
         ArduinoOTA.handle();
 
@@ -719,9 +719,9 @@ void otaTask(void *pvParameters)
             // The download can legitimately run long enough to trip the
             // watchdog — drop this task's WDT subscription for the
             // duration, then re-subscribe once it returns.
-            esp_task_wdt_delete(NULL);
+            //esp_task_wdt_delete(NULL);
             doOTA(pendingOTAUrl);
-            esp_task_wdt_add(NULL);
+            //esp_task_wdt_add(NULL);
         }
 
         vTaskDelay(pdMS_TO_TICKS(10));
@@ -733,11 +733,11 @@ void otaTask(void *pvParameters)
 // --------------------------------------------------
 void sensorTask(void *pvParameters)
 {
-    esp_task_wdt_add(NULL);
+    //esp_task_wdt_add(NULL);
 
     while (true)
     {
-        esp_task_wdt_reset();
+        //esp_task_wdt_reset();
 
         float temp = dht.readTemperature();
         float hum  = dht.readHumidity();
@@ -808,14 +808,14 @@ void sensorTask(void *pvParameters)
 
 void wifiTask(void *pvParameters)
 {
-    esp_task_wdt_add(NULL);
+    //esp_task_wdt_add(NULL);
 
     unsigned long lastPortalRetry = 0;
     unsigned long lastNtpSync     = 0;
 
     while (true)
     {
-        esp_task_wdt_reset();
+        //esp_task_wdt_reset();
 
         // ── Connected ────────────────────────────────────────────────────
         if (WiFi.status() == WL_CONNECTED)
@@ -903,7 +903,7 @@ void wifiTask(void *pvParameters)
                 int retries = 0;
                 while (WiFi.status() != WL_CONNECTED && retries < 20)
                 {
-                    esp_task_wdt_reset();
+                    //esp_task_wdt_reset();
                     Serial.print(".");
                     vTaskDelay(pdMS_TO_TICKS(500));
                     retries++;
@@ -967,7 +967,7 @@ void setup()
     // NOTE: this signature matches arduino-esp32 core <3.0. On core
     // 3.x, switch to the esp_task_wdt_config_t struct-based
     // esp_task_wdt_init().
-    esp_task_wdt_init(60, true);
+    //esp_task_wdt_init(60, true);
 
     Serial.println("Initialising AES key...");
     initializeAESKey();
